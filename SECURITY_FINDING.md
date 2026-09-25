@@ -1,5 +1,16 @@
 # Security Finding
 
+> **STATUS UPDATE (impact validation, supersedes the conclusion below): NOT EXPLOITABLE / FALSE POSITIVE.**
+> Runtime testing on WordPress 7.1.2 with Chromium (Playwright 1.56) proves the smuggled `}`
+> does **not** break out of the CSS rule in a real browser. `safecss_filter_attr()` only lets a
+> `}` survive when it is **inside** a CSS function's `(...)`, and per the CSS Syntax spec a `}`
+> inside `(...)` is consumed as part of the declaration value — it never terminates the rule.
+> The browser dropped the invalid declaration and created **no** attacker-controlled rule; the
+> attacker server received **zero** requests. There is no stored CSS injection, no exfiltration,
+> and no security-boundary crossing. See the "IMPACT VALIDATION" section at the end for the
+> evidence. The technical write-up below is retained as-is for the record but its impact claim
+> is withdrawn.
+
 ## Stored CSS injection via block "state styles" — `safecss_filter_attr()` allows `}` inside CSS functions, breaking out of generated stylesheet rules
 
 ### Summary
@@ -257,3 +268,75 @@ rule‑structural characters) before they are placed into a stylesheet rule in
 `safecss_filter_attr()` also reject values whose original form contains `}` even inside
 functions when destined for stylesheet output. `}` legitimately never appears in a valid CSS
 property value.
+
+---
+
+## IMPACT VALIDATION (runtime, WordPress 7.1.2) — CONCLUSION: NOT EXPLOITABLE
+
+Method: real 7.1.2 release tree served over HTTP (`php -S`), MariaDB backend, the malicious
+`core/button` post created by an **Author** (no `unfiltered_html`). The rendered front-end page
+was loaded in headless **Chromium (Playwright 1.56.1, build 1194)**, with an attacker-controlled
+HTTP logging server on `127.0.0.1:9099` as the `url()` target.
+
+### The generated stylesheet text does contain the smuggled `}` …
+Served page, `core-block-supports` inline stylesheet:
+```
+.wp-states-da56f435 .wp-block-button__link:hover {
+	color: rotate(0}.wp-block-button__link{background-image:url(http://127.0.0.1:9099/btn-fired)!important}) !important;
+}
+```
+
+### … but the browser does NOT break out of the rule.
+Chromium CSSOM after loading the page:
+```
+states rule: ".wp-states-da56f435 .wp-block-button__link:hover { }"   (EMPTY — invalid decl dropped)
+hasBody=false  hasBtnRule=false  hasEvil=false   totalRulesParsed=194
+computed .wp-block-button__link background-image: none
+Attacker requests observed: []   (zero)
+```
+Reason: `safecss_filter_attr()` only permits a `}` to survive when it is **inside** a CSS
+function's `(...)` (it is removed from the safety-check test string as part of a
+`rotate()/calc()/var()/url()/gradient()` block). Per the CSS Syntax Level 3 spec, a `}` inside a
+`(...)` block is consumed as part of the declaration value and does **not** end the qualified
+rule. The whole payload is therefore parsed as the (invalid) value of `color`, the declaration is
+discarded, the `:hover` rule is left empty, and **no new rule is created**. No `url()` is fetched.
+
+### Positive control (proves the test harness detects real breakouts)
+A page whose inline CSS contains a genuine **bare** `}` breakout
+(`.pc .btn:hover{color:red}.evil-injected{background-image:url(.../POSITIVE-CONTROL)!important}`)
+was loaded in the same harness:
+```
+Attacker requests observed: ["http://127.0.0.1:9099/POSITIVE-CONTROL"]   (FIRED)
+```
+So the negative result above is real, not a harness artifact.
+
+### safecss cannot emit a rule-terminating `}` in the first place
+Battery against 7.1.2's `safecss_filter_attr()` — for each output, whether it contains a `}`
+outside any `(...)` (i.e. capable of ending a rule):
+```
+bare brace              -> (empty)                                  bare-} outside (): no
+bare brace + rule       -> (empty)                                  bare-} outside (): no
+brace via calc paren    -> width: calc(1px}.evil{x:y})              bare-} outside (): no
+brace via rotate        -> transform: rotate(0}.evil{x:y})          bare-} outside (): no
+brace via url           -> (empty)                                  bare-} outside (): no
+brace via gradient      -> background: linear-gradient(red}.evil{x:y, blue)  bare-} outside (): no
+escaped brace (\7d)     -> (empty)                                  bare-} outside (): no
+close-paren then brace  -> (empty)                                  bare-} outside (): no
+```
+Every `}` that survives is trapped inside `(...)`; any `}` at rule-nesting level is stripped.
+A CSS rule can only be closed by a `}` outside `()`, so no breakout is achievable.
+
+### Structured result
+- **CONFIRMED IMPACT:** none. No attacker-controlled CSS rule is created; no outbound request; no computed-style effect.
+- **ATTACKER PRIVILEGE:** Author (`edit_posts`/`publish_posts`, no `unfiltered_html`) — moot, as there is no effect.
+- **VICTIM REQUIREMENT:** would have to view the post's front end; irrelevant since nothing fires.
+- **EXFILTRATION:** NO — attacker log empty in every viewer context; no `url()` fetch possible (no rule can be injected).
+- **PRIVILEGE / SECURITY-BOUNDARY CROSSING:** NO — the safecss boundary is not bypassed in effect; every surviving `}` is inert. The only author-reachable behavior (a legitimate `:hover` background `url()` via the state-styles feature itself) is by design and equivalent to embedding a remote image in a post.
+- **IMPACT LIMITATIONS:** cannot produce a rule-terminating `}`; cannot inject a selector/rule; cannot trigger a conditional `url()`; cannot exfiltrate; no admin/front-end privileged impact; no CSSOM corruption of adjacent rules (194 rules parsed intact).
+- **SEVERITY EVIDENCE:** empty `:hover` rule in CSSOM; zero attacker requests; positive control fired; safecss battery shows no bare `}` is ever emitted.
+
+### Bottom line
+The original finding correctly identified a cosmetic imperfection in `safecss_filter_attr()`
+(it can emit a `}` inside a function), but that imperfection has **no security impact**: the
+`}` is always paren-enclosed and inert under real CSS parsing, so the "stored CSS injection /
+stylesheet breakout" is not exploitable. The finding should not be reported as a vulnerability.
