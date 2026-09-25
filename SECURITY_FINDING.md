@@ -161,6 +161,94 @@ rule (with an outbound `url()`) in the front‑end block‑supports stylesheet.
   a real CSS rule block reachable with arbitrary `style` values) is new in 7.1.0. No matching
   advisory/test found in the repository.
 
+---
+
+## Supported‑version validation (added after version testing)
+
+Testing method: the official `WordPress/wordpress-develop` release tags `7.1.2`,
+`7.1.0`, `7.0.6`, `7.0.3`, `7.0.2` were fetched and the source trees bootstrapped against
+local MariaDB databases. The **same attack model** was run against each runnable release:
+Author account (no `unfiltered_html`, has `publish_posts`) → `wp_insert_post()` of a
+`core/button` block with a crafted `:hover` `color.text` value → `do_blocks()` render →
+inspect the block‑supports stylesheet.
+
+### SUPPORTED VERSION STATUS
+- **7.1.2 (latest supported): AFFECTED** — verified end‑to‑end.
+- **7.0.6 (latest 7.0.x): NOT AFFECTED** — the sink does not exist in 7.0.x.
+- **7.2‑alpha (63166): AFFECTED** — original finding.
+
+### 7.1.2 verified run
+```
+VER=7.1.2-src roles=author unfiltered_html=no publish_posts=YES
+insert=post 4  kses_survives=YES
+STYLESHEET: .wp-states-0da985f7 .wp-block-button__link:hover{color:rotate(0}.evil-injected{background:url(https://attacker.example/x.png)}) !important;}
+EXTERNAL_URL_RULE_INJECTED=YES
+```
+All chain conditions hold on 7.1.2: payload survives save‑time KSES, reaches the stylesheet
+generator, breaks out of the CSS declaration/rule, and produces an attacker‑controlled rule
+containing an external `url()`.
+
+### 7.0.6 verified run
+```
+VER=7.0.6-src roles=author unfiltered_html=no publish_posts=YES
+insert=post 4  kses_survives=YES
+STYLESHEET:
+EXTERNAL_URL_RULE_INJECTED=no
+```
+On 7.0.x the payload still survives KSES, but `src/wp-includes/block-supports/states.php`
+does not exist and no `wp_render_block_states_support()` filter runs, so no stylesheet is
+generated from block `style` values and there is no Author‑reachable stylesheet sink. The
+latent `safecss_filter_attr()` brace behaviour is present in 7.0.x but is not reachable by a
+low‑privilege user via this path.
+
+### INTRODUCTION POINT
+The exploitable sink — the **block "state styles" feature**
+(`src/wp-includes/block-supports/states.php`, `wp_render_block_states_support()` on
+`render_block`, feeding arbitrary block `style` values through the style engine into a
+generated stylesheet) — first shipped in the **WordPress 7.1.0 release**
+(present in tags `7.1.0`/`7.1.1`/`7.1.2`; absent in `7.0.6`). Public feature write‑up:
+"Pseudo and custom style states in WordPress 7.1"
+(make.wordpress.org/core/2026/08/05/…). The underlying `safecss_filter_attr()` behaviour of
+excluding balanced allowed‑function contents from the final safety check predates this and
+is old code; it becomes a security defect only once its output is placed into a stylesheet
+rule, which the 7.1.0 states feature is the first low‑privilege‑reachable path to do.
+`src/wp-includes/block-supports/states.php` and
+`WP_Style_Engine_CSS_Declarations::filter_declaration()` are byte‑identical between 7.1.2 and
+7.2‑alpha on the exploit path (the only `states.php` delta is a trivial `isset()` guard on
+line 402); the `safecss_filter_attr()` function‑strip/check block is identical across 7.1.2
+and 7.2‑alpha.
+
+### FIX STATUS
+**UNFIXED** as of the latest supported release **7.1.2** and in **7.2‑alpha**. Not addressed
+by any shipped security release:
+- **7.0.3** (Anthropic‑credited safecss fix) is a *different root cause* — a *fail‑open* when
+  the recursive function‑stripping `preg_replace()` hits a PCRE backtrack/stack limit.
+  Primary‑source diff `7.0.2 → 7.0.3` of `safecss_filter_attr()`:
+  ```
+  + // Bail if the recursive function stripping hit a PCRE error (e.g. stack/backtrack limit).
+  + if ( null === $css_test_string ) {
+  +     continue;
+  + }
+  - $allow_css = ! preg_match( '%[\\\(&=}]|/\*%', $css_test_string );
+  + $allow_css = 0 === preg_match( '%[\\\(&=}]|/\*%', $css_test_string );
+  ```
+  This finding does **not** rely on a PCRE failure; the function‑stripping succeeds and
+  legitimately removes a balanced `func(...)` group that carries the `}`. The bypass
+  reproduces on 7.1.2, which already contains the 7.0.3 fix.
+- **7.1.1** security fixes are all unrelated (XML‑RPC `edit_css` capability bypass;
+  custom‑header stored XSS; `wpautop()` unauth stored XSS; contributor arbitrary post
+  overwrite; REST templates path traversal; anonymous comment XSS).
+
+### DUPLICATE / KNOWN STATUS
+**Not a known duplicate.** No Trac ticket, CVE, WPScan/Patchstack advisory, or security‑release
+entry was found describing this root cause + exploit path (a `}` surviving inside an allowed
+CSS function in `safecss_filter_attr()` and breaking out of a **generated stylesheet rule**
+via the block state‑styles sink). The only adjacent public item is the 7.0.3 safecss
+fail‑open fix, shown above to be a materially different root cause. Blog/advisory pages
+(patchstack, wpscan, wordpress.org, wordify, therepository) were egress‑blocked from this
+environment; the distinguishing evidence used here is primary‑source (release‑tag code and
+diffs) plus search result summaries, which is stronger for the duplicate determination.
+
 ### Root‑cause / fix direction (not applied)
 The mismatch is that `safecss_filter_attr()` validates a function‑stripped copy but emits the
 original. Options: (a) reject/neutralize declaration *values* containing `}` (and other
